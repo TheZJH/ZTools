@@ -613,6 +613,8 @@ export class PluginManager {
       if (this.activeLaunch !== request) return
       const plugin = this.pluginViews.find((item) => item.path === pluginPath)
       if (!plugin) throw new Error('插件视图创建失败')
+      // 缓存视图首次加载超时后可能仍在加载，本次启动重新等待而不是复用超时结果。
+      plugin.loading.retryIfTimedOut()
       // 返回接受启动的结果，不让慢页面阻塞后续切换请求。
       void this.showPluginView(plugin, request, cmdName).catch((error) => {
         this.handleLaunchFailure(request, error)

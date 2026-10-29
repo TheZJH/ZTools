@@ -16,10 +16,21 @@ function createContents(): EventEmitter & WebContents {
 /**
  * 模拟主框架打开新文档或重载页面。
  * @param contents 接收导航事件的视图替身
+ * @param url 导航目标地址
  * @returns 无返回值
  */
-function navigate(contents: EventEmitter): void {
-  contents.emit('did-start-navigation', { isMainFrame: true, isSameDocument: false })
+function navigate(contents: EventEmitter, url = 'file:///plugin/index.html'): void {
+  contents.emit('did-start-navigation', { url, isMainFrame: true, isSameDocument: false })
+}
+
+/**
+ * 模拟主框架导航在提交前被取消，例如 will-navigate 中 preventDefault。
+ * @param contents 接收导航事件的视图替身
+ * @param url 被取消的导航地址
+ * @returns 无返回值
+ */
+function abortNavigation(contents: EventEmitter, url: string): void {
+  contents.emit('did-fail-provisional-load', {}, -3, 'ERR_ABORTED', url, true)
 }
 
 describe('plugin view readiness', () => {
@@ -137,6 +148,115 @@ describe('plugin view readiness', () => {
     contents.emit('destroyed')
     expect(contents.eventNames()).toEqual([])
     expect(readiness.isReady).toBe(false)
+  })
+
+  it('keeps a ready document usable when a cross-origin navigation is blocked', async () => {
+    const contents = createContents()
+    const readiness = createPluginViewReadiness(contents, 100)
+    navigate(contents)
+    contents.emit('dom-ready')
+
+    // will-navigate 拦截前已发出导航开始，随后以 ERR_ABORTED 取消且不会再有 dom-ready。
+    navigate(contents, 'https://github.com/example')
+    const blocked = readiness.ready
+    expect(readiness.isReady).toBe(false)
+    abortNavigation(contents, 'https://github.com/example')
+
+    await expect(blocked).resolves.toBe(true)
+    expect(readiness.isReady).toBe(true)
+    expect(vi.getTimerCount()).toBe(0)
+    await vi.advanceTimersByTimeAsync(100)
+    await expect(readiness.ready).resolves.toBe(true)
+  })
+
+  it('restores a ready document after the wait for a blocked navigation timed out', async () => {
+    const contents = createContents()
+    const readiness = createPluginViewReadiness(contents, 100)
+    navigate(contents)
+    contents.emit('dom-ready')
+
+    navigate(contents, 'https://github.com/example')
+    const blocked = readiness.ready
+    await vi.advanceTimersByTimeAsync(100)
+    await expect(blocked).resolves.toBe(false)
+
+    abortNavigation(contents, 'https://github.com/example')
+    await expect(readiness.ready).resolves.toBe(true)
+    expect(readiness.isReady).toBe(true)
+  })
+
+  it('only restores for the latest aborted navigation away from a ready document', async () => {
+    const contents = createContents()
+    const readiness = createPluginViewReadiness(contents)
+    navigate(contents)
+    contents.emit('dom-ready')
+
+    navigate(contents, 'https://a.example')
+    navigate(contents, 'https://b.example')
+    abortNavigation(contents, 'https://a.example')
+    expect(readiness.isReady).toBe(false)
+
+    contents.emit('did-fail-provisional-load', {}, -105, 'DNS', 'https://b.example', true)
+    contents.emit('did-fail-provisional-load', {}, -3, 'ERR_ABORTED', 'https://b.example', false)
+    expect(readiness.isReady).toBe(false)
+
+    abortNavigation(contents, 'https://b.example')
+    await expect(readiness.ready).resolves.toBe(true)
+  })
+
+  it('does not restore an aborted navigation when no document was ready before it', async () => {
+    const contents = createContents()
+    const readiness = createPluginViewReadiness(contents, 100)
+    navigate(contents)
+    const initial = readiness.ready
+
+    abortNavigation(contents, 'file:///plugin/index.html')
+    expect(readiness.isReady).toBe(false)
+    await vi.advanceTimersByTimeAsync(100)
+    await expect(initial).resolves.toBe(false)
+  })
+
+  it('starts a fresh wait for a later launch while a timed-out page is still loading', async () => {
+    const contents = createContents()
+    const readiness = createPluginViewReadiness(contents, 100)
+    navigate(contents)
+    const timedOutWait = readiness.ready
+    await vi.advanceTimersByTimeAsync(100)
+    await expect(timedOutWait).resolves.toBe(false)
+
+    readiness.retryIfTimedOut()
+    const retried = readiness.ready
+    expect(retried).not.toBe(timedOutWait)
+    expect(vi.getTimerCount()).toBe(1)
+    // 重复调用不会叠加计时器或替换仍在等待的 Promise。
+    readiness.retryIfTimedOut()
+    expect(readiness.ready).toBe(retried)
+    expect(vi.getTimerCount()).toBe(1)
+
+    contents.emit('dom-ready')
+    await expect(retried).resolves.toBe(true)
+    await expect(timedOutWait).resolves.toBe(false)
+  })
+
+  it('does not retry a wait that failed, succeeded or was destroyed', async () => {
+    const contents = createContents()
+    const readiness = createPluginViewReadiness(contents)
+    navigate(contents)
+    contents.emit('did-fail-load', {}, -105, 'DNS failure', 'https://example.invalid', true)
+    readiness.retryIfTimedOut()
+    await expect(readiness.ready).resolves.toBe(false)
+    expect(vi.getTimerCount()).toBe(0)
+
+    navigate(contents)
+    contents.emit('dom-ready')
+    const ready = readiness.ready
+    readiness.retryIfTimedOut()
+    expect(readiness.ready).toBe(ready)
+
+    contents.emit('destroyed')
+    readiness.retryIfTimedOut()
+    await expect(readiness.ready).resolves.toBe(false)
+    expect(vi.getTimerCount()).toBe(0)
   })
 
   it('returns false and removes every listener when a pending view is destroyed', async () => {
